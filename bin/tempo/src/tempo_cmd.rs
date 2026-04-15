@@ -7,10 +7,15 @@ use std::{
     sync::Arc,
 };
 
+use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::TransactionRequest;
+use alloy_signer_aws::{AwsSigner, aws_config, aws_sdk_kms};
+use alloy_signer_gcp::{GcpKeyRingRef, GcpSigner, KeySpecifier, gcloud_sdk};
+use alloy_signer_ledger::{HDPath as LedgerHDPath, LedgerSigner};
 use alloy_signer_local::PrivateKeySigner;
+use alloy_signer_trezor::{HDPath as TrezorHDPath, TrezorSigner};
 use alloy_sol_types::SolCall;
 use clap::Subcommand;
 use commonware_codec::{DecodeExt as _, Encode as _, ReadExt as _};
@@ -21,7 +26,7 @@ use commonware_cryptography::{
 };
 use commonware_math::algebra::Random as _;
 use commonware_utils::NZU64;
-use eyre::{OptionExt as _, Report, WrapErr as _, eyre};
+use eyre::{OptionExt as _, Report, WrapErr as _, bail, eyre};
 use reth_chainspec::EthChainSpec;
 use reth_cli_runner::CliRunner;
 use reth_ethereum_cli::ExtendedCommand;
@@ -36,8 +41,13 @@ use tempo_contracts::precompiles::{
 use tempo_dkg_onchain_artifacts::OnchainDkgOutcome;
 use tempo_precompiles::validator_config_v2::{VALIDATOR_NS_ADD, VALIDATOR_NS_ROTATE};
 use tempo_validator_config::ValidatorConfig;
+use zeroize::Zeroizing;
 
 use crate::{init_state, p2p_proxy::P2pProxyArgs};
+
+fn get_env(key: &str) -> eyre::Result<String> {
+    std::env::var(key).wrap_err_with(|| format!("failed reading environment variable `{key}`"))
+}
 
 /// Passthrough args for extension management commands.
 ///
@@ -235,11 +245,14 @@ async fn read_validator_from_contract(
 /// Shared validator identity arguments used across add/rotate/sign commands.
 #[derive(Debug, clap::Args)]
 pub(crate) struct ValidatorIdentityArgs {
-    /// The validator's address
+    /// The validator's Ethereum address
     #[arg(long, value_name = "ETHEREUM_ADDRESS")]
     validator_address: Address,
-    /// The identity key of the validator (0x-prefixed hex).
-    #[arg(long, value_name = "IDENTITY_KEY")]
+    /// The validator's signing key address (0x-prefixed hex).
+    #[arg(
+        long = "consensus.public-key",
+        value_name = "IDENTITY_PUBLIC_KEY_ADDRESS"
+    )]
     public_key: B256,
     /// The inbound address for the validator.
     #[arg(long, value_name = "IP:PORT")]
@@ -269,9 +282,9 @@ pub(crate) struct ValidatorSignatureArgs {
     #[arg(long, value_name = "SIGNATURE")]
     signature: Option<Bytes>,
 
-    /// Path to the ed25519 signing key file. The signature is computed
+    /// Path to the ed25519 signing private key file. The signature is computed
     /// automatically so a separate `create-*-signature` step is not needed.
-    #[arg(long, value_name = "FILE")]
+    #[arg(long = "consensus.signing-key", value_name = "FILE")]
     signing_key: Option<PathBuf>,
 }
 
@@ -287,18 +300,42 @@ impl ValidatorSignatureArgs {
                 Ok(sig.encode().into())
             }
             (None, None) => Err(eyre!(
-                "either --signature or --signing-key must be provided"
+                "either --signature or --consensus.signing-key must be provided"
             )),
         }
     }
 }
 
+#[derive(Debug, clap::Args)]
+#[group(required = true, multiple = false)]
+pub(crate) struct WalletArgs {
+    /// Path to the file holding the validator's Ethereum private key.
+    #[arg(long, value_name = "FILE", help_heading = "Wallet options - raw")]
+    wallet_key: Option<PathBuf>,
+
+    /// Use a Ledger hardware wallet.
+    #[arg(long, help_heading = "Wallet options - hardware wallet")]
+    ledger: bool,
+
+    /// Use a Trezor hardware wallet.
+    #[arg(long, help_heading = "Wallet options - hardware wallet")]
+    trezor: bool,
+
+    /// Use AWS KMS. Requires AWS_KMS_KEY_ID env var
+    #[arg(long, help_heading = "Wallet options - remote")]
+    aws: bool,
+
+    /// Use GCP KMS. Requires GCP_PROJECT_ID, GCP_LOCATION, GCP_KEY_RING, GCP_KEY_NAME,
+    /// GCP_KEY_VERSION env vars
+    #[arg(long, help_heading = "Wallet options - remote")]
+    gcp: bool,
+}
+
 /// Shared arguments for commands that update the validator config contract.
 #[derive(Debug, clap::Args)]
 pub(crate) struct ValidatorTransactionArgs {
-    /// Path to the file holding the Ethereum private key.
-    #[arg(long, value_name = "FILE")]
-    private_key: PathBuf,
+    #[command(flatten)]
+    wallet: WalletArgs,
 
     /// The RPC URL to submit the transaction to.
     #[arg(long, default_value = "https://rpc.presto.tempo.xyz")]
@@ -337,24 +374,73 @@ impl ValidatorTransactionArgs {
         }
     }
 
-    fn signer(&self) -> eyre::Result<PrivateKeySigner> {
-        let private_key_bytes = std::fs::read(&self.private_key)
-            .wrap_err("failed reading validator ethereum private key")?;
+    async fn wallet(&self) -> eyre::Result<EthereumWallet> {
+        if self.wallet.ledger {
+            let signer = LedgerSigner::new(LedgerHDPath::LedgerLive(0), None)
+                .await
+                .wrap_err("failed to connect to Ledger device")?;
 
-        let private_key = B256::try_from(private_key_bytes.as_slice())
-            .wrap_err("invalid validator ethereum private key")?;
+            Ok(EthereumWallet::new(signer))
+        } else if self.wallet.trezor {
+            let signer = TrezorSigner::new(TrezorHDPath::TrezorLive(0), None)
+                .await
+                .wrap_err("failed to connect to Trezor device")?;
 
-        Ok(PrivateKeySigner::from_bytes(&private_key)?)
+            Ok(EthereumWallet::new(signer))
+        } else if self.wallet.aws {
+            let key_id = get_env("AWS_KMS_KEY_ID")?;
+            let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let client = aws_sdk_kms::Client::new(&config);
+            let signer = AwsSigner::new(client, key_id, None)
+                .await
+                .wrap_err("failed to create AWS KMS signer")?;
+
+            Ok(EthereumWallet::new(signer))
+        } else if self.wallet.gcp {
+            let project = get_env("GCP_PROJECT_ID")?;
+            let location = get_env("GCP_LOCATION")?;
+            let keyring = get_env("GCP_KEY_RING")?;
+            let key_name = get_env("GCP_KEY_NAME")?;
+            let key_version: u64 = get_env("GCP_KEY_VERSION")?
+                .parse()
+                .wrap_err("GCP_KEY_VERSION must be a valid u64")?;
+
+            let keyring_ref = GcpKeyRingRef::new(&project, &location, &keyring);
+            let specifier = KeySpecifier::new(keyring_ref, &key_name, key_version);
+
+            let client = gcloud_sdk::GoogleApi::from_function(
+                gcloud_sdk::google::cloud::kms::v1::key_management_service_client::KeyManagementServiceClient::new,
+                "https://cloudkms.googleapis.com",
+                None,
+            )
+            .await
+            .wrap_err("failed to create GCP KMS client")?;
+
+            let signer = GcpSigner::new(client, specifier, None)
+                .await
+                .wrap_err("failed to create GCP KMS signer")?;
+
+            Ok(EthereumWallet::new(signer))
+        } else if let Some(path) = &self.wallet.wallet_key {
+            let private_key_bytes = Zeroizing::new(std::fs::read(path).wrap_err_with(|| {
+                format!("failed reading private key from `{}`", path.display())
+            })?);
+
+            let signer = PrivateKeySigner::from_slice(private_key_bytes.as_slice())
+                .wrap_err_with(|| format!("invalid private key in `{}`", path.display()))?;
+
+            Ok(EthereumWallet::new(signer))
+        } else {
+            bail!("a wallet option must be set")
+        }
     }
 
-    async fn provider(
-        &self,
-        signer: PrivateKeySigner,
-    ) -> eyre::Result<impl Provider<TempoNetwork>> {
+    async fn provider(&self) -> eyre::Result<impl Provider<TempoNetwork>> {
+        let wallet = self.wallet().await?;
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .fetch_chain_id()
             .with_gas_estimation()
-            .wallet(signer)
+            .wallet(wallet)
             .connect(&self.rpc_url)
             .await
             .wrap_err("failed to connect to RPC")?;
@@ -378,8 +464,7 @@ pub(crate) struct AddValidator {
 
 impl AddValidator {
     async fn run(self) -> eyre::Result<()> {
-        let signer = self.submit.signer()?;
-        let provider = self.submit.provider(signer).await?;
+        let provider = self.submit.provider().await?;
 
         let chain_id = provider
             .get_chain_id()
@@ -439,8 +524,7 @@ pub(crate) struct TransferValidatorOwnership {
 
 impl TransferValidatorOwnership {
     async fn run(self) -> eyre::Result<()> {
-        let signer = self.submit.signer()?;
-        let provider = self.submit.provider(signer).await?;
+        let provider = self.submit.provider().await?;
 
         let new_private_key_bytes = std::fs::read(&self.new_private_key)
             .wrap_err("failed reading new validator ethereum privatekey")?;
@@ -487,8 +571,7 @@ pub(crate) struct RotateValidator {
 
 impl RotateValidator {
     async fn run(self) -> eyre::Result<()> {
-        let signer = self.submit.signer()?;
-        let provider = self.submit.provider(signer).await?;
+        let provider = self.submit.provider().await?;
 
         let chain_id = provider
             .get_chain_id()
@@ -639,8 +722,7 @@ pub(crate) struct SetValidatorIpAddress {
 
 impl SetValidatorIpAddress {
     async fn run(self) -> eyre::Result<()> {
-        let signer = self.submit.signer()?;
-        let provider = self.submit.provider(signer).await?;
+        let provider = self.submit.provider().await?;
 
         if self.ingress.is_none() && self.egress.is_none() {
             return Err(eyre!("at least one of --ingress or --egress must be set"));
@@ -684,8 +766,7 @@ pub(crate) struct DeactivateValidator {
 
 impl DeactivateValidator {
     async fn run(self) -> eyre::Result<()> {
-        let signer = self.submit.signer()?;
-        let provider = self.submit.provider(signer).await?;
+        let provider = self.submit.provider().await?;
 
         let validator = read_validator_from_contract(&provider, self.id).await?;
 
@@ -726,8 +807,7 @@ pub(crate) struct SetValidatorFeeRecipient {
 
 impl SetValidatorFeeRecipient {
     async fn run(self) -> eyre::Result<()> {
-        let signer = self.submit.signer()?;
-        let provider = self.submit.provider(signer).await?;
+        let provider = self.submit.provider().await?;
 
         let validator = read_validator_from_contract(&provider, self.id).await?;
 
